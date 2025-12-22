@@ -9,10 +9,30 @@ sys.path.append(CURRENT_DIR)
 from misc import getFilesOfType
 from clustering.clustering_wrapper import perform1DClustering, evalMultiClustMethods
 
-from sklearn.cluster import KMeans, kmeans_plusplus,\
-    SpectralClustering, AgglomerativeClustering, DBSCAN
+from sklearn.cluster import KMeans, SpectralClustering, AgglomerativeClustering, DBSCAN
+try:
+    from sklearn.cluster import kmeans_plusplus
+except ImportError:
+    # For older sklearn versions, kmeans_plusplus doesn't exist
+    kmeans_plusplus = None
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics.cluster import pair_confusion_matrix
+try:
+    from sklearn.metrics.cluster import pair_confusion_matrix
+except ImportError:
+    # Fallback for older sklearn versions
+    def pair_confusion_matrix(labels_true, labels_pred):
+        from sklearn.metrics.cluster import contingency_matrix
+        contingency = contingency_matrix(labels_true, labels_pred)
+        n_c = np.sum(contingency, axis=1, dtype=np.int64)
+        n_k = np.sum(contingency, axis=0, dtype=np.int64)
+        n = np.sum(n_c)
+        sum_squares = np.sum(contingency**2)
+        C = np.empty((2, 2), dtype=np.int64)
+        C[1, 1] = int(sum_squares - n)
+        C[0, 1] = int(np.sum(n_k**2) - sum_squares)
+        C[1, 0] = int(np.sum(n_c**2) - sum_squares)
+        C[0, 0] = int(n**2 - C[0, 1] - C[1, 0] - sum_squares)
+        return C
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
 from collections import defaultdict
 from scipy.spatial import distance
