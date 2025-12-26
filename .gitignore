@@ -1,0 +1,4 @@
+processed/*
+keypoints/*
+*.pyc
+videos/*
