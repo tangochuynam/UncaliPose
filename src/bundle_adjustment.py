@@ -73,7 +73,8 @@ def visiblePtsIndex(pts):
 
 
 def rodriguesResidual(
-        K1, D1, M1, p1, K2s, D2s, M2s, p2s, x, fix_cam_pose=False):
+        K1, D1, M1, p1, K2s, D2s, M2s, p2s, x, fix_cam_pose=False, 
+        enforce_ankle_constraint=True, ankle_constraint_weight=10.0):
     '''
     Rodrigues residual.
     
@@ -86,8 +87,10 @@ def rodriguesResidual(
         D2s, [[1x5], ...], a list of distortion parameters of camera 2s.
         p2s, [[Nx2], ...], a list of extrinsic matrix of camera 2s.
         x, the flattened concatenation of r2s, t2s, and P (3D points).
+        enforce_ankle_constraint: If True, add constraint that left and right ankles have same height (Y coordinate)
+        ankle_constraint_weight: Weight for ankle height constraint (default: 10.0)
     Output:
-        residuals, 2D reprojection residual.
+        residuals, 2D reprojection residual (with optional ankle constraint).
     '''
     n_Pts = len(p1)
     M2s, P = variableToParams(x, M2s, n_Pts, fix_cam_pose=fix_cam_pose)
@@ -104,6 +107,29 @@ def rodriguesResidual(
         reproj_err.append(p2_.T - p2s[i][vis2])
     
     residuals = np.concatenate(reproj_err, axis=0).ravel(order='C')
+    
+    # Add ankle height constraint if enabled
+    # Joint indices: right_ankle=0, left_ankle=5 (for 16-joint Uplift format)
+    if enforce_ankle_constraint and n_Pts >= 6:
+        right_ankle_idx = 0
+        left_ankle_idx = 5
+        
+        # Check if both ankles are visible
+        if (not np.isnan(P[right_ankle_idx]).any() and 
+            not np.isnan(P[left_ankle_idx]).any()):
+            # Y coordinate is the vertical axis (index 1)
+            right_ankle_y = P[right_ankle_idx, 1]
+            left_ankle_y = P[left_ankle_idx, 1]
+            
+            # Constraint: ankles should be at same height (Y coordinate)
+            # Penalize the difference
+            ankle_height_diff = right_ankle_y - left_ankle_y
+            
+            # Add constraint residual (scaled by weight)
+            # Use sqrt(weight) so that when squared in least_squares, it becomes the weight
+            constraint_residual = np.sqrt(ankle_constraint_weight) * ankle_height_diff
+            residuals = np.concatenate([residuals, [constraint_residual]])
+    
     return residuals
 
 
@@ -177,8 +203,36 @@ def bundleAdjustment(K1, D1, M1, p1, K2s, D2s, M2s, p2s, Pts, Pts_prev=None,
     p2s_ = [p2[vis_ids] for p2 in p2s]
 
     func = lambda x: rodriguesResidual(
-        K1, D1, M1, p1_, K2s, D2s, M2s, p2s_, x,fix_cam_pose=fix_cam_pose)
-    jac_spars = jacobianSparsity([p1_]+list(p2s_),fix_cam_pose=fix_cam_pose)
+        K1, D1, M1, p1_, K2s, D2s, M2s, p2s_, x, fix_cam_pose=fix_cam_pose,
+        enforce_ankle_constraint=True, ankle_constraint_weight=500.0)
+    
+    # Update jacobian sparsity to account for ankle constraint (adds 1 more residual)
+    jac_spars = jacobianSparsity([p1_]+list(p2s_), fix_cam_pose=fix_cam_pose)
+    # Add one more row for ankle constraint (affects ankle joint Y coordinates)
+    if len(p1_) >= 6:  # Check if we have at least 6 joints (ankles are at indices 0 and 5)
+        # Ankle constraint affects right_ankle[1] and left_ankle[1] (Y coordinates)
+        n_cam2 = len(K2s)
+        n_res_orig, n_var = jac_spars.shape
+        # Create extended sparsity matrix
+        from scipy.sparse import lil_matrix
+        extended_spars = lil_matrix((n_res_orig + 1, n_var), dtype=int)
+        extended_spars[:n_res_orig, :] = jac_spars
+        # Ankle constraint row: affects Y coordinates of both ankles
+        # Find the indices of right_ankle and left_ankle in the visible points
+        right_ankle_orig_idx = 0  # right_ankle is at index 0
+        left_ankle_orig_idx = 5   # left_ankle is at index 5
+        # Check if these joints are visible
+        if right_ankle_orig_idx in vis_ids and left_ankle_orig_idx in vis_ids:
+            # Find their positions in the visible subset
+            right_ankle_vis_idx = np.where(vis_ids == right_ankle_orig_idx)[0][0]
+            left_ankle_vis_idx = np.where(vis_ids == left_ankle_orig_idx)[0][0]
+            # Y coordinate indices in the variable vector
+            right_ankle_y_idx = n_cam2*6 + right_ankle_vis_idx*3 + 1
+            left_ankle_y_idx = n_cam2*6 + left_ankle_vis_idx*3 + 1
+            if right_ankle_y_idx < n_var and left_ankle_y_idx < n_var:
+                extended_spars[n_res_orig, right_ankle_y_idx] = 1
+                extended_spars[n_res_orig, left_ankle_y_idx] = 1
+        jac_spars = extended_spars
     
     x_init = paramsToVariable(M2s, Pts_, fix_cam_pose=fix_cam_pose)
     res = sciopt.least_squares(

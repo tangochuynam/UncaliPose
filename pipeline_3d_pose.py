@@ -15,12 +15,16 @@ Usage:
     python pipeline_3d_pose.py --video_path /path/to/videos/swing1
     python pipeline_3d_pose.py --video_path /path/to/videos/swing1 --debug
     python pipeline_3d_pose.py --video_path /path/to/videos/swing1 --skip_processing
+    
+Note: By default, automatically loads config/pipeline_config.yml if it exists.
+      Use --config_file to specify a different config file.
 """
 
 import sys
 import os
 import argparse
 import numpy as np
+import yaml
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -67,12 +71,11 @@ Examples:
     parser.add_argument('--fps', type=int, default=30,
                        help='Output video FPS (default: 30)')
     parser.add_argument('--no_save_pose', action='store_true',
-                       help='Do not save/load camera pose (estimate per video)')
-    parser.add_argument('--expected_height_cm', type=float, default=None,
-                       help='Expected person height in cm (optional, for height calculation only). NOT used for camera pose optimization.')
-    parser.add_argument('--height_range_cm', type=float, nargs=2, default=None,
-                       metavar=('MIN', 'MAX'),
-                       help='Height range in cm (e.g., 160 180). Optional, for height calculation only.')
+                       help='Do not save/load camera pose (estimate per video) [DEPRECATED: use --reestimate_pose]')
+    parser.add_argument('--reestimate_pose', action='store_true',
+                       help='Force re-estimation of camera pose (ignore saved pose if exists)')
+    parser.add_argument('--config_file', type=str, default=None,
+                       help='Path to YAML config file (e.g., config/custom_config.yml). If not provided, automatically loads config/pipeline_config.yml if it exists, otherwise uses defaults.')
     
     args = parser.parse_args()
     
@@ -85,27 +88,23 @@ Examples:
     video_name = os.path.basename(video_path)
     data_dir = os.path.dirname(video_path)
     
-    # Verify structure: video_path should contain videos and keypoints JSON files
-    video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.avi'))]
+    # Verify structure: video_path should contain keypoints JSON files
+    # Video files are optional (only needed for debug visualization)
     json_files = [f for f in os.listdir(video_path) if f.endswith('.json')]
+    video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.avi'))]
     
-    if len(video_files) < 2:
-        print(f"✗ Error: Expected at least 2 video files in {video_path}, found {len(video_files)}")
-        return
     if len(json_files) < 2:
         print(f"✗ Error: Expected at least 2 JSON keypoint files in {video_path}, found {len(json_files)}")
         return
     
-    print(f"✓ Using video path: {video_path}")
-    
-    # Calculate expected height from range if provided (for height calculation only)
-    if args.height_range_cm:
-        expected_height_m = np.mean(args.height_range_cm) / 100.0
-        print(f"Using height range {args.height_range_cm[0]}-{args.height_range_cm[1]} cm (average: {expected_height_m*100:.1f} cm) for height calculation")
-    elif args.expected_height_cm:
-        expected_height_m = args.expected_height_cm / 100.0
+    # Video files are optional - warn if not found but don't fail
+    if len(video_files) < 2:
+        print(f"⚠ Warning: Found {len(video_files)} video files. Debug visualization will be skipped.")
+        print(f"  (Videos are optional - camera pose estimation only requires JSON keypoint files)")
     else:
-        expected_height_m = None  # Use original scale from triangulation
+        print(f"✓ Found {len(video_files)} video files and {len(json_files)} JSON files")
+    
+    print(f"✓ Using video path: {video_path}")
     
     # Initialize logger
     log_dir = os.path.join(data_dir, 'processed', video_name, 'logs')
@@ -117,15 +116,60 @@ Examples:
     logger.info(f"Data directory: {data_dir}")
     logger.info(f"Video name: {video_name}")
     logger.info(f"World camera: {'side' if args.world_cam_id == 1 else 'front'}")
-    if expected_height_m:
-        logger.info(f"Expected height: {expected_height_m*100:.1f} cm (for height calculation only)")
-    else:
-        logger.info("Using original author's scale (no height normalization)")
     logger.info(f"Log file: {logger.get_log_file()}")
     logger.info("="*70)
     
-    # Initialize dataset
+    # Load configuration
+    # Default behavior: automatically load config/pipeline_config.yml if it exists
+    # User can override with --config_file flag
+    default_config_path = os.path.join(os.path.dirname(__file__), 'config', 'pipeline_config.yml')
+    
+    # Determine which config file to use
+    if args.config_file:
+        # User explicitly provided a config file (override default)
+        config_file_path = args.config_file
+    elif os.path.exists(default_config_path):
+        # Use default config file if it exists
+        config_file_path = default_config_path
+    else:
+        # No config file available, use defaults
+        config_file_path = None
+    
+    # Start with default config
     config = create_default_config()
+    
+    # Load and merge config from file if available
+    if config_file_path:
+        if os.path.exists(config_file_path):
+            with open(config_file_path, 'r') as f:
+                file_config = yaml.safe_load(f)
+                # Merge file config into default config
+                for key, value in file_config.items():
+                    if isinstance(value, dict) and key in config:
+                        config[key].update(value)
+                    else:
+                        config[key] = value
+            if logger:
+                if config_file_path == default_config_path:
+                    logger.info(f"Loaded configuration from default file: {config_file_path}")
+                else:
+                    logger.info(f"Loaded configuration from: {config_file_path}")
+        else:
+            if logger:
+                logger.warning(f"Config file not found: {config_file_path}, using defaults")
+    else:
+        if logger:
+            logger.info("Using default configuration (config/pipeline_config.yml not found)")
+    
+    # Override reestimate_pose from command line if provided
+    if args.reestimate_pose:
+        if 'camera_pose' not in config:
+            config['camera_pose'] = {}
+        config['camera_pose']['reestimate_pose'] = True
+        if logger:
+            logger.info("Command-line flag --reestimate_pose: forcing camera pose re-estimation")
+    
+    # Initialize dataset
     dataset = TwoViewCustom(None, None, config, video_path=video_path)
     
     # Process frames
@@ -135,7 +179,6 @@ Examples:
             wrld_cam_id=args.world_cam_id,
             use_saved_pose=not args.no_save_pose,
             use_single_pose=True,
-            expected_height_m=expected_height_m,
             logger=logger
         )
     else:
@@ -145,17 +188,27 @@ Examples:
             return
     
     # Create visualizations
-    if not args.skip_visualization:
+    create_3d_animation = config.get('visualization', {}).get('create_3d_animation', True)
+    if not args.skip_visualization and create_3d_animation:
         logger.info("Creating 3D visualization video")
-        create_3d_visualization(video_path, fps=args.fps, logger=logger)
+        create_3d_visualization(video_path, fps=args.fps, config=config, logger=logger)
+    elif not create_3d_animation:
+        logger.info("Skipping 3D animation creation (disabled in config)")
     
-    # Always create debug visualization (shows 2D keypoint comparison)
-    logger.info("Creating DEBUG visualization (2D keypoints: Original vs Reprojected)")
-    debug_file = create_debug_visualization(video_path, fps=args.fps, logger=logger)
-    if debug_file:
-        logger.info(f"Debug visualization saved: {debug_file}")
+    # Create debug visualization only if video files are available
+    video_files = [f for f in os.listdir(video_path) if f.endswith(('.mp4', '.avi'))]
+    if len(video_files) >= 2:
+        logger.info("Creating DEBUG visualization (3D views + 2D keypoints: Original vs Reprojected)")
+        # Get number of threads for debug visualization (default: 8)
+        num_threads = config.get('visualization', {}).get('debug_num_threads', 8)
+        debug_file = create_debug_visualization(video_path, fps=args.fps, config=config, 
+                                              logger=logger, num_threads=num_threads)
+        if debug_file:
+            logger.info(f"Debug visualization saved: {debug_file}")
+        else:
+            logger.warning("Debug visualization could not be created")
     else:
-        logger.warning("Debug visualization could not be created (video files may be missing)")
+        logger.info("Skipping debug visualization (video files not found - only JSON keypoint files provided)")
     
     logger.info("="*70)
     logger.info("Pipeline Complete!")

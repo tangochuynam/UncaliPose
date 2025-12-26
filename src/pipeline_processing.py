@@ -18,7 +18,7 @@ from src.pipeline_camera_pose import triangulate_with_fixed_pose
 
 
 def process_single_frame(frame_id, dataset, config, wrld_cam_id, estimated_pose=None,
-                        use_single_pose=True, expected_height_m=None, logger=None):
+                        use_single_pose=True, logger=None):
     """
     Process a single frame to generate 3D keypoints.
     
@@ -29,7 +29,6 @@ def process_single_frame(frame_id, dataset, config, wrld_cam_id, estimated_pose=
         wrld_cam_id: World camera ID
         estimated_pose: Pre-estimated camera pose (if using single pose)
         use_single_pose: Whether to use single pose for all frames
-        expected_height_m: Expected person height in meters
         logger: Optional logger instance
     
     Returns:
@@ -237,7 +236,7 @@ def process_single_frame(frame_id, dataset, config, wrld_cam_id, estimated_pose=
 
 
 def process_all_frames(dataset, config, wrld_cam_id=1, use_saved_pose=True, 
-                      use_single_pose=True, expected_height_m=None, logger=None):
+                      use_single_pose=True, logger=None):
     """
     Process all frames and generate 3D keypoints.
     
@@ -247,7 +246,6 @@ def process_all_frames(dataset, config, wrld_cam_id=1, use_saved_pose=True,
         wrld_cam_id: World camera ID
         use_saved_pose: Whether to use saved camera pose
         use_single_pose: Whether to use single pose for all frames
-        expected_height_m: Expected person height in meters
         logger: Optional logger instance
     
     Returns:
@@ -301,7 +299,22 @@ def process_all_frames(dataset, config, wrld_cam_id=1, use_saved_pose=True,
     pose_frame_id = None
     pose_rmse = None
     
-    if use_saved_pose:
+    # Check if we should re-estimate (from config or parameter)
+    pose_config = config.get('camera_pose', {}) if config else {}
+    reestimate_pose = pose_config.get('reestimate_pose', False)
+    
+    if logger:
+        logger.info(f"Camera pose config: reestimate_pose={reestimate_pose}, use_saved_pose={use_saved_pose}")
+        logger.info(f"Camera pose file path: {pose_manager.pose_file}")
+        logger.info(f"Camera pose file exists: {os.path.exists(pose_manager.pose_file)}")
+    
+    # If reestimate_pose is True, skip loading saved pose
+    if reestimate_pose:
+        if logger:
+            logger.info("Re-estimation requested: ignoring saved camera pose (if exists)")
+        # Don't load saved pose, will estimate new one below
+    elif use_saved_pose:
+        # Try to load saved pose
         estimated_pose, pose_frame_id, pose_rmse, pose_time = pose_manager.load()
         if estimated_pose is not None:
             if logger:
@@ -309,20 +322,46 @@ def process_all_frames(dataset, config, wrld_cam_id=1, use_saved_pose=True,
                 if pose_time:
                     logger.info(f"Original estimation time: {pose_time:.2f} seconds")
             use_single_pose = True
+        else:
+            if logger:
+                logger.warning(f"Saved camera pose not found or could not be loaded from: {pose_manager.pose_file}")
+                logger.warning("Will proceed to estimate new camera pose")
     
+    # Only estimate new pose if we don't have one and reestimate_pose is False
+    # If reestimate_pose is True, we always estimate (even if saved pose exists)
     if estimated_pose is None and use_single_pose:
         if logger:
             logger.info("Finding best camera pose...")
-            logger.info(f"RMSE threshold: < 4.0 pixels")
-            logger.info("Using original author's approach (no height-based scale optimization)")
+        
+        # Get camera pose config (with defaults) - already loaded above
+        max_candidates = pose_config.get('max_candidates', 40)
+        max_rmse_threshold = pose_config.get('max_rmse_threshold', 4.0)
+        target_rmse = pose_config.get('target_rmse', 2.0)
+        enforce_ankle_constraint = pose_config.get('enforce_ankle_constraint', True)
+        max_ankle_diff_cm = pose_config.get('max_ankle_diff_cm', 5.0)
+        ankle_weight = pose_config.get('ankle_weight', 2.0)
+        
+        if logger:
+            logger.info(f"RMSE threshold: < {max_rmse_threshold} pixels")
+            logger.info(f"Max candidates: {max_candidates} frames")
+        
         estimated_pose, pose_rmse, pose_frame_id, pose_time = pose_manager.find_best_pose(
-            dataset, config, wrld_cam_id, expected_height_m=None, max_rmse_threshold=4.0
+            dataset, config, wrld_cam_id,
+            max_rmse_threshold=max_rmse_threshold,
+            max_candidates=max_candidates,
+            target_rmse=target_rmse,
+            enforce_ankle_constraint=enforce_ankle_constraint,
+            max_ankle_diff_cm=max_ankle_diff_cm,
+            ankle_weight=ankle_weight
         )
         if logger and pose_time:
             logger.info(f"Camera pose estimation completed in {pose_time:.2f} seconds")
         
         if estimated_pose is not None:
-            pose_manager.save(estimated_pose, pose_frame_id, pose_rmse, pose_time)
+            # Get save_intrinsics flag from config (default: False - only save estimated pose)
+            save_intrinsics = pose_config.get('save_intrinsics', False)
+            pose_manager.save(estimated_pose, pose_frame_id, pose_rmse, pose_time, 
+                            dataset=dataset, wrld_cam_id=wrld_cam_id, include_intrinsics=save_intrinsics)
         else:
             if logger:
                 logger.warning("Falling back to per-frame pose estimation")
@@ -346,7 +385,7 @@ def process_all_frames(dataset, config, wrld_cam_id=1, use_saved_pose=True,
         
         result_data = process_single_frame(
             frame_id, dataset, config, wrld_cam_id, estimated_pose,
-            use_single_pose, expected_height_m, logger
+            use_single_pose, logger
         )
         
         if 'error' in result_data:

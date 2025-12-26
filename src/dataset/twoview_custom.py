@@ -23,15 +23,43 @@ class TwoViewCustom(object):
     Custom dataset class for 2-view setup (front and side camera).
     
     Expected data structure:
+    
+    **Option 1: Direct video path mode (recommended)**
+    A single folder containing:
+    - **REQUIRED**: At least 2 keypoints JSON files (one for front, one for side)
+      - One file with 'front' in filename (e.g., `front_keypoints.json`, `*front*.json`)
+      - One file with 'side' in filename (e.g., `side_keypoints.json`, `*side*.json`)
+    - **OPTIONAL**: 2 video files (if full dataset)
+      - One file with 'front' in filename (e.g., `front_video.mp4`, `*front*.mp4`)
+      - One file with 'side' in filename (e.g., `side_video.mp4`, `*side*.mp4`)
+    
+    Example:
+    ```
+    videos/swing1/
+    ├── front_keypoints.json  (REQUIRED)
+    ├── side_keypoints.json   (REQUIRED)
+    ├── front_video.mp4       (OPTIONAL)
+    └── side_video.mp4        (OPTIONAL)
+    ```
+    
+    **Option 2: Traditional separated structure**
+    ```
     data_dir/
     ├── videos/
     │   └── swing1/
-    │       ├── front.mp4 (or front/)
-    │       └── side.mp4 (or side/)
+    │       ├── front.mp4 (or front/)  (OPTIONAL)
+    │       └── side.mp4 (or side/)   (OPTIONAL)
     └── keypoints/
         └── swing1/
-            ├── front.json (or front/*.json)
-            └── side.json (or side/*.json)
+            ├── front.json (or front/*.json)  (REQUIRED)
+            └── side.json (or side/*.json)    (REQUIRED)
+    ```
+    
+    **IMPORTANT File Naming Requirements:**
+    - All files (JSON and video) MUST contain 'front' or 'side' in their filename (case-insensitive)
+    - The pipeline will raise an error if it cannot identify which file is front/side
+    - Examples of valid names: `front_keypoints.json`, `side_video.mp4`, `my_front_camera.mp4`
+    - Examples of invalid names: `camera1.json`, `video1.mp4` (no front/side identifier)
     """
     
     def __init__(self, data_dir, video_name='swing1', config=None, video_path=None):
@@ -43,6 +71,12 @@ class TwoViewCustom(object):
             video_name: Name of the video folder (default: 'swing1', ignored if video_path is provided)
             config: Configuration dictionary
             video_path: Direct path to video folder (overrides data_dir/video_name)
+                       This folder should contain at least 2 keypoints JSON files (front and side)
+                       and optionally 2 video files (front and side) if available.
+        
+        Raises:
+            ValueError: If keypoints JSON files cannot be identified as front/side (missing 'front' or 'side' in filename)
+            FileNotFoundError: If required keypoints files are not found
         """
         if video_path:
             # Direct path mode: video_path contains videos and keypoints JSON
@@ -77,16 +111,11 @@ class TwoViewCustom(object):
         }
         self._detectVideoFiles()
         
-        # Setup directories
+        # Setup directories (for compatibility, but don't create them)
         self.video_frame_dir = os.path.join(data_dir, 'processed', video_name, 'video_frame')
         self.pose2d_file_dir = os.path.join(data_dir, 'processed', video_name, 'pose2d_label')
         self.boxcrop_dir = os.path.join(data_dir, 'processed', video_name, 'box_crop')
         self.calibration_file = os.path.join(data_dir, 'processed', video_name, 'calibration.json')
-        
-        # Create directories if they don't exist
-        os.makedirs(self.video_frame_dir, exist_ok=True)
-        os.makedirs(self.pose2d_file_dir, exist_ok=True)
-        os.makedirs(self.boxcrop_dir, exist_ok=True)
         
         # Joint configuration (Uplift Order - 16 joints)
         # Order: right_ankle(0), right_knee(1), right_hip(2), left_hip(3), 
@@ -217,27 +246,21 @@ class TwoViewCustom(object):
     def _detectVideoFiles(self):
         """
         Detect and map video files to camera names.
-        Handles specific file naming patterns.
+        Matches files by 'front' or 'side' string in filename (case-insensitive).
         """
         if not os.path.exists(self.video_dir):
             return
         
-        video_files = sorted(glob.glob(os.path.join(self.video_dir, '*.mp4')))
+        video_files = sorted(glob.glob(os.path.join(self.video_dir, '*.mp4'))) + \
+                     sorted(glob.glob(os.path.join(self.video_dir, '*.avi')))
         
-        # Known mappings (user-specified)
-        known_mappings = {
-            '44CA7CF5-E031-44AA-97DC-8047B513EAB6': 'front',
-            'FBD2D8A3-A7F7-4351-911A-56794228B7ED': 'side'
-        }
-        
-        # Try to match video files to cameras
+        # Match video files by 'front' or 'side' string in filename
         for video_file in video_files:
-            filename = os.path.basename(video_file)
-            # Check for known patterns
-            for pattern, cam_name in known_mappings.items():
-                if pattern in filename:
-                    self.video_file_map[cam_name] = video_file
-                    break
+            filename_lower = os.path.basename(video_file).lower()
+            if 'front' in filename_lower and self.video_file_map.get('front') is None:
+                self.video_file_map['front'] = video_file
+            elif 'side' in filename_lower and self.video_file_map.get('side') is None:
+                self.video_file_map['side'] = video_file
         
         # If not all cameras mapped, use order (first = front, second = side)
         unmapped_cams = [cam for cam in self.cam_names if self.video_file_map[cam] is None]
@@ -272,26 +295,43 @@ class TwoViewCustom(object):
         """
         Initialize default camera parameters.
         These will be refined during pose estimation.
-        Uses actual video resolution if available.
+        First tries to get resolution from JSON files (keypoints_2d), then from videos.
         """
         cameras = {}
         default_focal = 1000.0  # Approximate focal length in pixels
         
         for i, cam_name in enumerate(self.cam_names):
-            # Get actual resolution from video
-            resolution = self._getVideoResolution(cam_name)
+            # Priority order for resolution:
+            # 1. Explicit resolution field in JSON (img_resolution, resolution, width/height) - most reliable
+            # 2. Video file resolution (reliable if video exists)
+            # 3. Infer from keypoint coordinates (less reliable, keypoints may not cover full image)
+            # 4. Default resolution
+            
+            resolution = None
+            resolution_source = None
+            
+            # First, try to get explicit resolution from JSON
+            json_res = self._inferResolutionFromKeypoints(cam_name)
+            if json_res:
+                resolution = json_res
+                # Check if it came from explicit field or was inferred
+                # (The function checks for img_resolution/resolution/width/height first)
+                resolution_source = "JSON (img_resolution field)"
+            
+            # Prefer video resolution over inferred keypoint resolution (but not over explicit JSON resolution)
+            if resolution is None:
+                video_res = self._getVideoResolution(cam_name)
+                if video_res is not None:
+                    resolution = video_res
+                    resolution_source = "video file"
             
             if resolution is None:
-                # Fallback to default if video not available
-                # Try to infer from keypoints if available
-                resolution = self._inferResolutionFromKeypoints(cam_name)
-                if resolution is None:
-                    resolution = (1920, 1080)  # Final fallback
-                    print(f"Warning: Using default resolution {resolution} for {cam_name}")
-                else:
-                    print(f"Using inferred resolution {resolution} for {cam_name} from keypoints")
+                # Final fallback
+                resolution = (1920, 1080)
+                resolution_source = "default"
+                print(f"Warning: Using default resolution {resolution} for {cam_name}")
             else:
-                print(f"Using actual video resolution {resolution} for {cam_name}")
+                print(f"Using resolution {resolution} for {cam_name} from {resolution_source}")
             
             width, height = resolution
             
@@ -319,26 +359,80 @@ class TwoViewCustom(object):
     
     def _inferResolutionFromKeypoints(self, cam_name):
         """
-        Try to infer image resolution from keypoint coordinates.
+        Try to infer image resolution from keypoint coordinates in JSON files.
+        First tries to read from video directory JSON files (with keypoints_2d key),
+        then falls back to keypoints directory.
         Returns (width, height) or None.
         """
         try:
-            # Check keypoint files
-            keypoint_file = os.path.join(self.keypoints_dir, f'{cam_name}.json')
-            if not os.path.exists(keypoint_file):
-                keypoint_dir = os.path.join(self.keypoints_dir, cam_name)
-                if os.path.isdir(keypoint_dir):
-                    keypoint_files = sorted(glob.glob(os.path.join(keypoint_dir, '*.json')))
-                    if len(keypoint_files) > 0:
-                        keypoint_file = keypoint_files[0]
+            # First, try to find JSON files in videos directory (with keypoints_2d key)
+            keypoint_file = None
             
-            if os.path.exists(keypoint_file):
+            # Try video directory first (for keypoints_2d format)
+            # Match by camera name in filename (case-insensitive)
+            video_json_files = glob.glob(os.path.join(self.video_dir, '*.json'))
+            matching_files = [f for f in video_json_files if cam_name in os.path.basename(f).lower()]
+            if matching_files:
+                keypoint_file = matching_files[0]
+            
+            # If not found, try alternative matching
+            if not keypoint_file and self.keypoints_dir == self.video_dir:
+                all_json_files = glob.glob(os.path.join(self.keypoints_dir, '*.json'))
+                matching_files = [f for f in all_json_files if cam_name in os.path.basename(f).lower()]
+                if matching_files:
+                    keypoint_file = matching_files[0]
+            
+            # Fallback to keypoints directory
+            if not keypoint_file:
+                keypoint_file = os.path.join(self.keypoints_dir, f'{cam_name}.json')
+                if not os.path.exists(keypoint_file):
+                    keypoint_dir = os.path.join(self.keypoints_dir, cam_name)
+                    if os.path.isdir(keypoint_dir):
+                        keypoint_files = sorted(glob.glob(os.path.join(keypoint_dir, '*.json')))
+                        if len(keypoint_files) > 0:
+                            keypoint_file = keypoint_files[0]
+            
+            if keypoint_file and os.path.exists(keypoint_file):
                 with open(keypoint_file, 'r') as f:
                     data = json.load(f)
                 
-                # Extract keypoints
+                # First, check if JSON has explicit resolution fields (priority order)
+                # Check img_resolution first (common in keypoint JSON files)
+                if 'img_resolution' in data:
+                    res = data['img_resolution']
+                    if isinstance(res, (list, tuple)) and len(res) >= 2:
+                        return (int(res[0]), int(res[1]))
+                
+                # Check resolution field
+                if 'resolution' in data:
+                    res = data['resolution']
+                    if isinstance(res, (list, tuple)) and len(res) >= 2:
+                        return (int(res[0]), int(res[1]))
+                    elif isinstance(res, dict):
+                        if 'width' in res and 'height' in res:
+                            return (int(res['width']), int(res['height']))
+                
+                # Check width/height fields
+                if 'width' in data and 'height' in data:
+                    return (int(data['width']), int(data['height']))
+                
+                # Extract keypoints - try keypoints_2d format first
                 kpts = None
-                if 'keypoints' in data:
+                if 'keypoints_2d' in data:
+                    kpts_data = data['keypoints_2d']
+                    if isinstance(kpts_data, list) and len(kpts_data) > 0:
+                        # Get first frame
+                        frame_kpts = kpts_data[0]
+                        if isinstance(frame_kpts, list) and len(frame_kpts) > 0:
+                            if isinstance(frame_kpts[0], list):
+                                # Already in [[x, y], ...] format
+                                kpts = np.array([[pt[0], pt[1]] if len(pt) >= 2 else [np.nan, np.nan] for pt in frame_kpts])
+                            else:
+                                # Flat list, try to reshape
+                                kpts = np.array(frame_kpts).reshape(-1, 2)
+                
+                # Fallback to 'keypoints' format
+                if kpts is None and 'keypoints' in data:
                     kpts_data = data['keypoints']
                     if isinstance(kpts_data, list) and len(kpts_data) > 0:
                         if isinstance(kpts_data[0], list):
@@ -351,25 +445,28 @@ class TwoViewCustom(object):
                 
                 if kpts is not None and len(kpts) > 0:
                     # Get max coordinates and add padding
-                    max_x = np.nanmax(kpts[:, 0]) if kpts.shape[1] >= 1 else 0
-                    max_y = np.nanmax(kpts[:, 1]) if kpts.shape[1] >= 2 else 0
-                    
-                    # Add 20% padding and round to common resolutions
-                    width = int((max_x * 1.2) // 100 * 100)  # Round to nearest 100
-                    height = int((max_y * 1.2) // 100 * 100)
-                    
-                    # Ensure reasonable minimum
-                    width = max(width, 640)
-                    height = max(height, 480)
-                    
-                    # Round to common video resolutions
-                    common_widths = [640, 1280, 1920, 2560]
-                    common_heights = [480, 720, 1080, 1440]
-                    
-                    width = min(common_widths, key=lambda x: abs(x - width))
-                    height = min(common_heights, key=lambda x: abs(x - height))
-                    
-                    return (width, height)
+                    valid_mask = ~np.isnan(kpts).any(axis=1)
+                    if np.any(valid_mask):
+                        valid_kpts = kpts[valid_mask]
+                        max_x = np.max(valid_kpts[:, 0]) if valid_kpts.shape[1] >= 1 else 0
+                        max_y = np.max(valid_kpts[:, 1]) if valid_kpts.shape[1] >= 2 else 0
+                        
+                        # Add 20% padding and round to common resolutions
+                        width = int((max_x * 1.2) // 100 * 100)  # Round to nearest 100
+                        height = int((max_y * 1.2) // 100 * 100)
+                        
+                        # Ensure reasonable minimum
+                        width = max(width, 640)
+                        height = max(height, 480)
+                        
+                        # Round to common video resolutions
+                        common_widths = [640, 1280, 1920, 2560]
+                        common_heights = [480, 720, 1080, 1440]
+                        
+                        width = min(common_widths, key=lambda x: abs(x - width))
+                        height = min(common_heights, key=lambda x: abs(x - height))
+                        
+                        return (width, height)
         except Exception as e:
             pass
         
@@ -544,58 +641,45 @@ class TwoViewCustom(object):
         cap.release()
         return frame_count
     
-    def prepareDataFromKeypoints(self):
+    # ============================================================================
+    # File Discovery and Validation Methods
+    # ============================================================================
+    
+    def _findKeypointFiles(self):
         """
-        Prepare data structure from keypoint files.
-        Converts keypoint files to the expected format.
-        First tries to read from videos directory JSON files (keypoints_2d key),
-        then falls back to keypoints directory.
-        """
-        print("Preparing data from keypoints...")
+        Find keypoint JSON files for all cameras.
         
-        # First, try to find keypoint files in videos directory (with keypoints_2d key)
+        Returns:
+            tuple: (keypoint_files dict, keypoints_from_videos dict)
+        """
         keypoint_files = {}
         keypoints_from_videos = {}
         
-        # Map camera names to video file patterns
-        video_patterns = {
-            'front': '44CA7CF5-E031-44AA-97DC-8047B513EAB6',
-            'side': 'FBD2D8A3-A7F7-4351-911A-56794228B7ED'
-        }
-        
-        # Try to find JSON files in videos directory
         for cam_name in self.cam_names:
             found = False
-            if cam_name in video_patterns:
-                pattern = video_patterns[cam_name]
-                # Look for JSON files matching the pattern
-                video_json_files = glob.glob(os.path.join(self.video_dir, f'*{pattern}*.json'))
-                if video_json_files:
-                    # Use the first matching file
-                    keypoint_files[cam_name] = [video_json_files[0]]
-                    keypoints_from_videos[cam_name] = True
-                    print(f"Found keypoints in video directory for {cam_name}: {os.path.basename(video_json_files[0])}")
-                    found = True
             
-            # If not found by pattern, try alternative matching (for video_path mode)
+            # Look for JSON files containing camera name in filename (case-insensitive)
+            video_json_files = glob.glob(os.path.join(self.video_dir, '*.json'))
+            matching_files = [f for f in video_json_files if cam_name in os.path.basename(f).lower()]
+            
+            if matching_files:
+                # Use the first matching file
+                keypoint_files[cam_name] = [matching_files[0]]
+                keypoints_from_videos[cam_name] = True
+                print(f"Found keypoints in video directory for {cam_name}: {os.path.basename(matching_files[0])}")
+                found = True
+            
+            # If not found, try alternative matching (for video_path mode)
             if not found and self.keypoints_dir == self.video_dir:
                 # In video_path mode, keypoints_dir == video_dir, so look for any JSON files
                 all_json_files = glob.glob(os.path.join(self.keypoints_dir, '*.json'))
-                # Try to match by filename pattern
-                if cam_name == 'front':
-                    matching_files = [f for f in all_json_files if '44CA7CF5' in os.path.basename(f)]
-                    if matching_files:
-                        keypoint_files[cam_name] = [matching_files[0]]
-                        keypoints_from_videos[cam_name] = True
-                        print(f"Found keypoints for {cam_name} by alternative pattern matching: {os.path.basename(matching_files[0])}")
-                        found = True
-                elif cam_name == 'side':
-                    matching_files = [f for f in all_json_files if 'FBD2D8A3' in os.path.basename(f)]
-                    if matching_files:
-                        keypoint_files[cam_name] = [matching_files[0]]
-                        keypoints_from_videos[cam_name] = True
-                        print(f"Found keypoints for {cam_name} by alternative pattern matching: {os.path.basename(matching_files[0])}")
-                        found = True
+                # Match by camera name in filename (case-insensitive)
+                matching_files = [f for f in all_json_files if cam_name in os.path.basename(f).lower()]
+                if matching_files:
+                    keypoint_files[cam_name] = [matching_files[0]]
+                    keypoints_from_videos[cam_name] = True
+                    print(f"Found keypoints for {cam_name} by pattern matching: {os.path.basename(matching_files[0])}")
+                    found = True
             
             if found:
                 continue
@@ -619,9 +703,167 @@ class TwoViewCustom(object):
                     keypoint_files[cam_name] = [json_file]
                     keypoints_from_videos[cam_name] = False
                 else:
-                    raise FileNotFoundError(f"Keypoint file not found for {cam_name}. Searched in: {self.video_dir} and {self.keypoints_dir}")
+                    # Check if there are JSON files but they don't contain 'front' or 'side' in filename
+                    all_json_files = glob.glob(os.path.join(self.video_dir, '*.json')) + \
+                                   glob.glob(os.path.join(self.keypoints_dir, '*.json'))
+                    all_json_files = list(set(all_json_files))  # Remove duplicates
+                    
+                    if all_json_files:
+                        # Check if any JSON files exist but don't have 'front' or 'side' in name
+                        json_basenames = [os.path.basename(f) for f in all_json_files]
+                        has_front = any('front' in name.lower() for name in json_basenames)
+                        has_side = any('side' in name.lower() for name in json_basenames)
+                        
+                        if not has_front or not has_side:
+                            error_msg = f"\n{'='*70}\n"
+                            error_msg += f"ERROR: Cannot identify front/side camera files\n"
+                            error_msg += f"{'='*70}\n"
+                            error_msg += f"Found {len(all_json_files)} JSON file(s) but cannot determine which is front/side:\n"
+                            for f in all_json_files:
+                                error_msg += f"  - {os.path.basename(f)}\n"
+                            error_msg += f"\nSOLUTION: Rename your JSON files to include 'front' or 'side' in the filename.\n"
+                            error_msg += f"Examples:\n"
+                            error_msg += f"  - front_keypoints.json (or *front*.json)\n"
+                            error_msg += f"  - side_keypoints.json (or *side*.json)\n"
+                            error_msg += f"\nSearched in:\n"
+                            error_msg += f"  - {self.video_dir}\n"
+                            error_msg += f"  - {self.keypoints_dir}\n"
+                            error_msg += f"{'='*70}\n"
+                            raise ValueError(error_msg)
+                    
+                    # No JSON files found at all
+                    raise FileNotFoundError(
+                        f"Keypoint file not found for {cam_name}.\n"
+                        f"Searched in: {self.video_dir} and {self.keypoints_dir}\n"
+                        f"Expected: JSON files containing 'front' or 'side' in filename"
+                    )
         
-        # Determine number of frames
+        return keypoint_files, keypoints_from_videos
+    
+    def _raiseFileIdentificationError(self, all_json_files):
+        """Raise error when JSON files cannot be identified as front/side."""
+        json_basenames = [os.path.basename(f) for f in all_json_files]
+        has_front = any('front' in name.lower() for name in json_basenames)
+        has_side = any('side' in name.lower() for name in json_basenames)
+        
+        if not has_front or not has_side:
+            error_msg = f"\n{'='*70}\n"
+            error_msg += f"ERROR: Cannot identify front/side camera files\n"
+            error_msg += f"{'='*70}\n"
+            error_msg += f"Found {len(all_json_files)} JSON file(s) but cannot determine which is front/side:\n"
+            for f in all_json_files:
+                error_msg += f"  - {os.path.basename(f)}\n"
+            error_msg += f"\nSOLUTION: Rename your JSON files to include 'front' or 'side' in the filename.\n"
+            error_msg += f"Examples:\n"
+            error_msg += f"  - front_keypoints.json (or *front*.json)\n"
+            error_msg += f"  - side_keypoints.json (or *side*.json)\n"
+            error_msg += f"\nSearched in:\n"
+            error_msg += f"  - {self.video_dir}\n"
+            error_msg += f"  - {self.keypoints_dir}\n"
+            error_msg += f"{'='*70}\n"
+            raise ValueError(error_msg)
+    
+    def _validateJsonFile(self, json_file, cam_name):
+        """
+        Validate that JSON file contains required keys.
+        
+        Args:
+            json_file: Path to JSON file
+            cam_name: Camera name (for error messages)
+        
+        Raises:
+            ValueError: If required keys are missing or invalid
+        """
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+            
+            # Validate 'keypoints_2d' key exists
+            if 'keypoints_2d' not in data:
+                error_msg = f"\n{'='*70}\n"
+                error_msg += f"ERROR: Missing required key 'keypoints_2d' in JSON file\n"
+                error_msg += f"{'='*70}\n"
+                error_msg += f"File: {os.path.basename(json_file)}\n"
+                error_msg += f"Camera: {cam_name}\n"
+                error_msg += f"\nJSON files MUST contain the 'keypoints_2d' key with 2D keypoint data.\n"
+                error_msg += f"Found keys in file: {list(data.keys())[:10]}\n"
+                error_msg += f"{'='*70}\n"
+                raise ValueError(error_msg)
+            
+            # Validate 'img_resolution' key exists, or check if we can get from video
+            has_img_resolution = 'img_resolution' in data
+            has_resolution = 'resolution' in data
+            has_width_height = 'width' in data and 'height' in data
+            
+            if not (has_img_resolution or has_resolution or has_width_height):
+                # Try to get resolution from video file
+                video_res = self._getVideoResolution(cam_name)
+                if video_res is None:
+                    error_msg = f"\n{'='*70}\n"
+                    error_msg += f"ERROR: Missing required key 'img_resolution' in JSON file\n"
+                    error_msg += f"{'='*70}\n"
+                    error_msg += f"File: {os.path.basename(json_file)}\n"
+                    error_msg += f"Camera: {cam_name}\n"
+                    error_msg += f"\nJSON files MUST contain the 'img_resolution' key with [width, height].\n"
+                    error_msg += f"Alternatively, provide a video file to extract resolution from.\n"
+                    error_msg += f"\nFound keys in file: {list(data.keys())[:10]}\n"
+                    error_msg += f"\nSOLUTION:\n"
+                    error_msg += f"  1. Add 'img_resolution': [width, height] to your JSON file, OR\n"
+                    error_msg += f"  2. Provide a video file (with '{cam_name}' in filename) to extract resolution\n"
+                    error_msg += f"\nExample JSON structure:\n"
+                    error_msg += f"  {{\n"
+                    error_msg += f"    \"keypoints_2d\": [...],\n"
+                    error_msg += f"    \"img_resolution\": [960, 1080]\n"
+                    error_msg += f"  }}\n"
+                    error_msg += f"{'='*70}\n"
+                    raise ValueError(error_msg)
+                else:
+                    print(f"Warning: JSON file for {cam_name} missing 'img_resolution', using resolution from video: {video_res}")
+            else:
+                # Validate img_resolution format
+                if has_img_resolution:
+                    res = data['img_resolution']
+                    if not (isinstance(res, (list, tuple)) and len(res) >= 2):
+                        error_msg = f"\n{'='*70}\n"
+                        error_msg += f"ERROR: Invalid 'img_resolution' format in JSON file\n"
+                        error_msg += f"{'='*70}\n"
+                        error_msg += f"File: {os.path.basename(json_file)}\n"
+                        error_msg += f"Camera: {cam_name}\n"
+                        error_msg += f"\n'img_resolution' must be a list/tuple with [width, height].\n"
+                        error_msg += f"Found: {res}\n"
+                        error_msg += f"\nExample: \"img_resolution\": [960, 1080]\n"
+                        error_msg += f"{'='*70}\n"
+                        raise ValueError(error_msg)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON file for {cam_name}: {json_file}\nError: {e}")
+        except Exception as e:
+            if isinstance(e, (ValueError, FileNotFoundError)):
+                raise
+            raise ValueError(f"Error reading JSON file for {cam_name}: {json_file}\nError: {e}")
+    
+    def _validateAllJsonFiles(self, keypoint_files):
+        """Validate all JSON files have required keys."""
+        for cam_name in self.cam_names:
+            if cam_name not in keypoint_files or len(keypoint_files[cam_name]) == 0:
+                continue
+            
+            json_file = keypoint_files[cam_name][0]
+            self._validateJsonFile(json_file, cam_name)
+    
+    # ============================================================================
+    # Frame Counting Methods
+    # ============================================================================
+    
+    def _countFrames(self, keypoint_files):
+        """
+        Determine the number of frames from keypoint files.
+        
+        Args:
+            keypoint_files: Dict mapping camera names to lists of keypoint file paths
+        
+        Returns:
+            int: Number of frames
+        """
         # If single file, check if it contains multiple frames
         if all(len(files) == 1 for files in keypoint_files.values()):
             # Check if single file contains multiple frames
@@ -744,25 +986,136 @@ class TwoViewCustom(object):
                     padded[:len(kpts)] = kpts
                     kpts = padded
                 
-                # Save 2D pose label
-                cam_pose_dir = os.path.join(self.pose2d_file_dir, cam_name)
-                os.makedirs(cam_pose_dir, exist_ok=True)
-                
-                pose_file = os.path.join(cam_pose_dir, f'{frame_id:08d}.json')
-                pose_data = {
-                    'joint_type': 'Uplift',
-                    'bodies': [{'id': 0, 'joints': kpts.tolist()}]
-                }
-                json.dump(pose_data, open(pose_file, 'w'))
+                # NOTE: We no longer save pose2d_label files to avoid unnecessary file I/O
+                # Keypoints are loaded directly from source JSON files when needed
+        
+        # Store n_frames as instance variable for easy access
+        self.n_frames = n_frames
         
         print(f"Prepared {n_frames} frames of keypoint data")
         return n_frames
+    
+    def _loadKeypointsFromJson(self, json_file, frame_id=0):
+        """
+        Load keypoints from a JSON file for a specific frame.
+        
+        Args:
+            json_file: Path to JSON file
+            frame_id: Frame index (for multi-frame files)
+        
+        Returns:
+            np.ndarray: Keypoints array of shape (16, 2)
+        """
+        kpts_data = json.load(open(json_file, 'r'))
+        
+        # Check for keypoints_2d key (from video JSON files)
+        if 'keypoints_2d' in kpts_data:
+            kpts_list = kpts_data['keypoints_2d']
+            if isinstance(kpts_list, list) and len(kpts_list) > 0:
+                if frame_id < len(kpts_list):
+                    frame_kpts = kpts_list[frame_id]
+                    if isinstance(frame_kpts, list) and len(frame_kpts) > 0:
+                        kpts = np.array([[pt[0], pt[1]] for pt in frame_kpts if len(pt) >= 2])
+                    else:
+                        kpts = np.array([])
+                else:
+                    last_frame = kpts_list[-1]
+                    kpts = np.array([[pt[0], pt[1]] for pt in last_frame if len(pt) >= 2])
+            else:
+                kpts = np.array([])
+        elif 'keypoints' in kpts_data:
+            kpts_list = kpts_data['keypoints']
+            if isinstance(kpts_list, list) and len(kpts_list) > 0:
+                if isinstance(kpts_list[0], list) and len(kpts_list[0]) > 0:
+                    if isinstance(kpts_list[0][0], list):
+                        # List of frames
+                        if frame_id < len(kpts_list):
+                            kpts = np.array(kpts_list[frame_id])
+                        else:
+                            kpts = np.array(kpts_list[-1])
+                    else:
+                        # Single frame
+                        kpts = np.array(kpts_list)
+                else:
+                    kpts = self.loadKeypoints(json_file)
+            else:
+                kpts = self.loadKeypoints(json_file)
+        elif 'frames' in kpts_data:
+            if frame_id < len(kpts_data['frames']):
+                frame_data = kpts_data['frames'][frame_id]
+                if 'keypoints' in frame_data:
+                    kpts = np.array(frame_data['keypoints'])
+                else:
+                    kpts = self.loadKeypoints(json_file)
+            else:
+                kpts = np.array(kpts_data['frames'][-1].get('keypoints', []))
+        else:
+            kpts = self.loadKeypoints(json_file)
+        
+        # Ensure correct number of joints (16 for Uplift format)
+        if len(kpts) > 16:
+            kpts = kpts[:16]
+        elif len(kpts) < 16:
+            padded = np.full((16, 2), np.nan)
+            padded[:len(kpts)] = kpts
+            kpts = padded
+        
+        return kpts
+    
+    # ============================================================================
+    # Main Data Preparation Method
+    # ============================================================================
+    
+    def prepareDataFromKeypoints(self):
+        """
+        Prepare data structure from keypoint files.
+        Converts keypoint files to the expected format.
+        First tries to read from videos directory JSON files (keypoints_2d key),
+        then falls back to keypoints directory.
+        
+        Validates that JSON files contain:
+        - 'keypoints_2d': Required key with 2D keypoint data
+        - 'img_resolution': Required key with [width, height], or video file must be provided
+        
+        Raises:
+            ValueError: If required keys are missing in JSON files
+        """
+        print("Preparing data from keypoints...")
+        
+        # Find keypoint files
+        keypoint_files, keypoints_from_videos = self._findKeypointFiles()
+        
+        # Validate JSON files
+        self._validateAllJsonFiles(keypoint_files)
+        
+        # Count frames
+        n_frames = self._countFrames(keypoint_files)
+        
+        # Process each frame (validation only - we don't save files anymore)
+        for frame_id in range(n_frames):
+            for cam_name in self.cam_names:
+                # Load keypoints for validation (we don't save them anymore)
+                if len(keypoint_files[cam_name]) == 1:
+                    self._loadKeypointsFromJson(keypoint_files[cam_name][0], frame_id)
+                else:
+                    self._loadKeypointsFromJson(keypoint_files[cam_name][frame_id], 0)
+        
+        # Store n_frames as instance variable for easy access
+        self.n_frames = n_frames
+        
+        print(f"Prepared {n_frames} frames of keypoint data")
+        return n_frames
+    
+    # ============================================================================
+    # Frame Data Access Methods
+    # ============================================================================
     
     def getSingleFrameMultiView2DJoints(self, frame_id):
         """Extract 2D joints for a single frame from all views."""
         joints_dict = {}
         
         for cam_name in self.cam_names:
+            # First try pose2d_file_dir (for backward compatibility with old data)
             pose_file = os.path.join(self.pose2d_file_dir, cam_name, f'{frame_id:08d}.json')
             
             if os.path.exists(pose_file):
@@ -778,6 +1131,72 @@ class TwoViewCustom(object):
                 
                 joints_dict[cam_name] = frame_joints_dict
             else:
+                # Load directly from source JSON files (keypoints_2d format)
+                # Find the keypoint file for this camera
+                keypoint_file = None
+                
+                # Try to find JSON file in video directory
+                if self.keypoints_dir == self.video_dir:
+                    # Look for JSON files matching camera name in filename (case-insensitive)
+                    json_files = glob.glob(os.path.join(self.video_dir, '*.json'))
+                    matching = [f for f in json_files if cam_name in os.path.basename(f).lower()]
+                    if matching:
+                        keypoint_file = matching[0]
+                    else:
+                        # If no match found, check if JSON files exist but don't have front/side in name
+                        if json_files:
+                            json_basenames = [os.path.basename(f) for f in json_files]
+                            has_front = any('front' in name.lower() for name in json_basenames)
+                            has_side = any('side' in name.lower() for name in json_basenames)
+                            
+                            if not has_front or not has_side:
+                                error_msg = f"\n{'='*70}\n"
+                                error_msg += f"ERROR: Cannot identify {cam_name} camera file\n"
+                                error_msg += f"{'='*70}\n"
+                                error_msg += f"Found {len(json_files)} JSON file(s) but cannot determine which is {cam_name}:\n"
+                                for f in json_files:
+                                    error_msg += f"  - {os.path.basename(f)}\n"
+                                error_msg += f"\nSOLUTION: Rename your JSON files to include 'front' or 'side' in the filename.\n"
+                                error_msg += f"Examples:\n"
+                                error_msg += f"  - front_keypoints.json (or *front*.json)\n"
+                                error_msg += f"  - side_keypoints.json (or *side*.json)\n"
+                                error_msg += f"{'='*70}\n"
+                                raise ValueError(error_msg)
+                
+                if keypoint_file and os.path.exists(keypoint_file):
+                    try:
+                        with open(keypoint_file, 'r') as f:
+                            kpts_data = json.load(f)
+                        
+                        # Check for keypoints_2d format
+                        if 'keypoints_2d' in kpts_data:
+                            kpts_list = kpts_data['keypoints_2d']
+                            if isinstance(kpts_list, list) and len(kpts_list) > frame_id:
+                                frame_kpts = kpts_list[frame_id]
+                                # Convert to [[x, y], ...] format
+                                if isinstance(frame_kpts, list) and len(frame_kpts) > 0:
+                                    if isinstance(frame_kpts[0], list):
+                                        # Already in [[x, y], ...] format
+                                        keypoints_2d = np.array([[pt[0], pt[1]] if len(pt) >= 2 else [np.nan, np.nan] for pt in frame_kpts])
+                                    else:
+                                        # Flat list, try to reshape
+                                        keypoints_2d = np.array(frame_kpts).reshape(-1, 2)
+                                    
+                                    # Ensure 16 keypoints
+                                    if len(keypoints_2d) > 16:
+                                        keypoints_2d = keypoints_2d[:16]
+                                    elif len(keypoints_2d) < 16:
+                                        padded = np.full((16, 2), np.nan)
+                                        padded[:len(keypoints_2d)] = keypoints_2d
+                                        keypoints_2d = padded
+                                    
+                                    frame_joints_dict = {(frame_id, 0): keypoints_2d}
+                                    joints_dict[cam_name] = frame_joints_dict
+                                    continue
+                    except Exception:
+                        pass
+                
+                # Fallback: empty dict
                 joints_dict[cam_name] = {}
         
         return joints_dict

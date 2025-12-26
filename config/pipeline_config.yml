@@ -1,0 +1,85 @@
+# Pipeline Configuration File
+# This file contains configurable parameters for the 3D pose estimation pipeline
+
+# ============================================================================
+# Visualization Configuration
+# ============================================================================
+visualization:
+    # Enable/disable visualizations
+    create_3d_animation: false         # If true, create 3d_keypoints_animation.mp4
+                                      # If false, skip 3D animation creation (saves time)
+    
+    # Front view angle calculation
+    auto_calculate_view_angle: false   # If true, automatically calculate from keypoints
+                                      # If false, use fixed_view_azim and fixed_view_elev below
+    
+    # Fixed view angles (used when auto_calculate_view_angle = false)
+    fixed_view_azim: 0.0              # Azimuth angle in degrees (0 = front view)
+                                       # Examples: 0.0, 5.0, -5.0, 90.0, -90.0
+    fixed_view_elev: 0.0               # Elevation angle in degrees (0 = horizontal view)
+    
+    # Auto-calculation settings (used when auto_calculate_view_angle = true)
+    view_angle_sample_frames: 5       # Number of frames to sample for auto calculation
+    
+    # Debug visualization multi-threading
+    debug_num_threads: 20              # Number of threads for parallel frame processing (default: 8)
+                                      # More threads = faster processing but more memory usage
+    
+    # 3D skeleton visualization size control
+    radius_padding_multiplier: 1.0     # Multiplier for padding around skeleton (1.5 = more padding/smaller, 1.0 = less padding/bigger)
+                                      # Lower values = skeleton appears larger
+                                      # Higher values = skeleton appears smaller
+    radius_minimum: 0.2                # Minimum RADIUS for axis limits (0.4 = larger view, 0.2 = tighter view)
+                                      # Lower values = skeleton appears larger
+                                      # Higher values = skeleton appears smaller
+
+# ============================================================================
+# Camera Pose Estimation Configuration
+# ============================================================================
+camera_pose:
+    # Pose estimation control
+    reestimate_pose: false            # If true, always re-estimate (ignore saved pose)
+                                      # If false, use saved pose if available, estimate only if not found
+    
+    # Camera pose saving options
+    save_intrinsics: false            # If true, save intrinsic and distortion parameters in camera_pose.json
+                                      # If false, only save estimated pose (R, t) - default
+                                      # Note: Intrinsics/distortion are DEFAULT values, NOT estimated by UncaliPose
+    
+    # Frame sampling
+    max_candidates: 20                # Maximum number of frames to sample for camera pose estimation
+                                      # More frames = better coverage but slower processing
+                                      # Fewer frames = faster but may miss optimal pose
+    
+    # RMSE thresholds
+    max_rmse_threshold: 4.0           # Maximum allowed RMSE in pixels
+    target_rmse: 2.0                  # Target RMSE in pixels (prioritizes frames below this)
+    
+    # Ankle constraint (for balanced 3D keypoints)
+    enforce_ankle_constraint: true    # Enable ankle height balance constraint
+    max_ankle_diff_cm: 5.0            # Maximum allowed ankle height difference in cm
+    ankle_weight: 2.0                 # Weight for ankle difference in combined score
+                                      # (1cm difference = ankle_weight pixels penalty)
+
+# ============================================================================
+# Example Configurations
+# ============================================================================
+# 
+# Example 1: Use fixed 5-degree front view angle
+# visualization:
+#     auto_calculate_view_angle: false
+#     fixed_view_azim: 5.0
+#     fixed_view_elev: 0.0
+#
+# Example 2: Sample only 20 frames for camera pose (faster)
+# camera_pose:
+#     max_candidates: 20
+#
+# Example 3: Disable ankle constraint (faster, but may have unbalanced ankles)
+# camera_pose:
+#     enforce_ankle_constraint: false
+#
+# Example 4: Force re-estimation (ignore saved pose)
+# camera_pose:
+#     reestimate_pose: true
+

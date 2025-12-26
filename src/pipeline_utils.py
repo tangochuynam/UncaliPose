@@ -38,6 +38,42 @@ COLORS_2D = {
 # Height Calculation
 # ============================================================================
 
+def calculate_ankle_height_difference(keypoints_3d, joint_names=None):
+    """
+    Calculate the height difference between left and right ankles.
+    
+    Args:
+        keypoints_3d: [Nx3] array of 3D keypoints
+        joint_names: List of joint names (optional, uses JOINT_NAMES if None)
+    
+    Returns:
+        height_diff: Absolute difference in Y coordinate (vertical) between ankles in meters
+        Returns None if ankles are not available
+    """
+    if joint_names is None:
+        joint_names = JOINT_NAMES
+    
+    if len(keypoints_3d) != len(joint_names):
+        return None
+    
+    # Joint indices: right_ankle=0, left_ankle=5 (for 16-joint Uplift format)
+    right_ankle_idx = 0
+    left_ankle_idx = 5
+    
+    # Check if both ankles are valid
+    if (np.isnan(keypoints_3d[right_ankle_idx]).any() or 
+        np.isnan(keypoints_3d[left_ankle_idx]).any()):
+        return None
+    
+    # Y coordinate is the vertical axis (index 1)
+    right_ankle_y = keypoints_3d[right_ankle_idx, 1]
+    left_ankle_y = keypoints_3d[left_ankle_idx, 1]
+    
+    # Return absolute difference
+    height_diff = abs(right_ankle_y - left_ankle_y)
+    return height_diff
+
+
 def calculate_person_height(keypoints_3d, joint_names, validate=False):
     """Calculate person height from 3D keypoints."""
     if len(keypoints_3d) != len(joint_names):
@@ -260,6 +296,21 @@ def create_default_config():
         'bundle': {
             'max_iter': 50,
             'alpha': 1.0
+        },
+        'visualization': {
+            'auto_calculate_view_angle': True,  # If False, use fixed values below
+            'fixed_view_azim': 0.0,  # Fixed azimuth angle in degrees (used when auto_calculate_view_angle=False)
+            'fixed_view_elev': 0.0,  # Fixed elevation angle in degrees
+            'view_angle_sample_frames': 5  # Number of frames to sample for auto calculation
+        },
+        'camera_pose': {
+            'reestimate_pose': False,  # If True, always re-estimate (ignore saved pose)
+            'max_candidates': 20,  # Maximum number of frames to sample for camera pose estimation
+            'max_rmse_threshold': 4.0,  # Maximum allowed RMSE in pixels
+            'target_rmse': 2.0,  # Target RMSE in pixels
+            'enforce_ankle_constraint': True,  # Enable ankle height balance constraint
+            'max_ankle_diff_cm': 5.0,  # Maximum allowed ankle height difference in cm
+            'ankle_weight': 2.0  # Weight for ankle difference in combined score (1cm = ankle_weight pixels penalty)
         }
     }
 
